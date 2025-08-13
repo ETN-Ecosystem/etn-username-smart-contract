@@ -1,0 +1,123 @@
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+#include "imports/jetton-op-codes.fc";
+#include "imports/utils.fc";
+
+(int, slice, slice, cell) load_data() inline {
+  slice ds = get_data().begin_parse();
+  return (ds~load_coins(), ds~load_msg_addr(), ds~load_msg_addr(), ds~load_ref());
+}
+
+() save_data(int balance, slice owner_address, slice jetton_master_address, cell jetton_wallet_code) impure {
+  set_data(begin_cell()
+    .store_coins(balance)
+    .store_slice(owner_address)
+    .store_slice(jetton_master_address)
+    .store_ref(jetton_wallet_code)
+    .end_cell()
+  );
+}
+
+() send_tokens(int query_id, int jetton_amount, slice to_owner_address, slice response_address, cell custom_payload, int forward_ton_amount, cell forward_payload) impure {
+  var (balance, owner_address, jetton_master_address, jetton_wallet_code) = load_data();
+  throw_if(33, jetton_amount > balance);
+
+  cell state_init = calculate_jetton_wallet_state_init(to_owner_address, jetton_master_address, jetton_wallet_code);
+  slice to_wallet_address = calculate_jetton_wallet_address(state_init);
+
+  var msg = begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(to_wallet_address)
+    .store_coins(forward_ton_amount)
+    .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_ref(begin_cell()
+      .store_uint(op::internal_transfer, 32)
+      .store_uint(query_id, 64)
+      .store_coins(jetton_amount)
+      .store_slice(owner_address)
+      .store_slice(response_address)
+      .store_coins(forward_ton_amount)
+      .store_maybe_ref(forward_payload)
+      .end_cell());
+  send_raw_message(msg.end_cell(), 64);
+
+  save_data(balance - jetton_amount, owner_address, jetton_master_address, jetton_wallet_code);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender_address = cs~load_msg_addr();
+
+  var (balance, owner_address, jetton_master_address, jetton_wallet_code) = load_data();
+
+  int op = in_msg_body~load_uint(32);
+  int query_id = in_msg_body~load_uint(64);
+
+  if (op == op::transfer) {
+    throw_unless(34, equal_slices(sender_address, owner_address));
+    int jetton_amount = in_msg_body~load_coins();
+    slice to_owner_address = in_msg_body~load_msg_addr();
+    slice response_address = in_msg_body~load_msg_addr();
+    cell custom_payload = in_msg_body~load_maybe_ref();
+    int forward_ton_amount = in_msg_body~load_coins();
+    cell forward_payload = in_msg_body~load_maybe_ref();
+    send_tokens(query_id, jetton_amount, to_owner_address, response_address, custom_payload, forward_ton_amount, forward_payload);
+    return ();
+  }
+
+  if (op == op::internal_transfer) {
+    int jetton_amount = in_msg_body~load_coins();
+    slice from_address = in_msg_body~load_msg_addr();
+    slice response_address = in_msg_body~load_msg_addr();
+    int forward_ton_amount = in_msg_body~load_coins();
+    cell forward_payload = in_msg_body~load_maybe_ref();
+
+    var msg = begin_cell()
+      .store_uint(0x10, 6)
+      .store_slice(from_address)
+      .store_coins(0)
+      .store_uint(op::transfer_notification, 32)
+      .store_uint(query_id, 64)
+      .store_coins(jetton_amount)
+      .store_slice(from_address)
+      .store_maybe_ref(forward_payload);
+    send_raw_message(msg.end_cell(), 64);
+
+    save_data(balance + jetton_amount, owner_address, jetton_master_address, jetton_wallet_code);
+    return ();
+  }
+
+  if (op == op::burn) {
+    throw_unless(34, equal_slices(sender_address, owner_address));
+    int jetton_amount = in_msg_body~load_coins();
+    slice response_address = in_msg_body~load_msg_addr();
+    cell custom_payload = in_msg_body~load_maybe_ref();
+
+    throw_if(33, jetton_amount > balance);
+
+    var msg = begin_cell()
+      .store_uint(0x18, 6)
+      .store_slice(jetton_master_address)
+      .store_coins(0)
+      .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_ref(begin_cell()
+        .store_uint(op::burn_notification, 32)
+        .store_uint(query_id, 64)
+        .store_coins(jetton_amount)
+        .store_slice(owner_address)
+        .store_slice(response_address)
+        .end_cell());
+    send_raw_message(msg.end_cell(), 64);
+
+    save_data(balance - jetton_amount, owner_address, jetton_master_address, jetton_wallet_code);
+    return ();
+  }
+
+  throw(0xffff);
+}
+
+(int, slice, slice) get_wallet_data() method_id {
+  var (balance, owner_address, jetton_master_address, _) = load_data();
+  return (balance, owner_address, jetton_master_address);
+}
